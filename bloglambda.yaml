@@ -1,0 +1,277 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Main CF template that builds shared resources and other stacks
+Parameters:
+  Email:
+    Type: String
+    Description: Get your email that you have for Jira
+  Server:
+    Type: String
+    Description: Jira Server link
+  ParameterName:
+    Type: String
+    Description: API token from Jira stored in SSM https://docs.searchunify.com/Content/Content-Sources/Atlassian-Jira-Confluence-Authentication-Create-API-Token.htm
+    Default: Jira_API
+  ProjectKey:
+    Type: String
+    Description: The Key of a jira project. Can be found in the brackets by the name of the project
+  ProjectName:
+    Type: String
+    Description: The name of a jira project. Can be found at the top of the project
+
+
+Mappings:
+  RegionMap:
+       eu-west-1:        {CodeBucket: aws-well-architected-labs-ireland }
+       us-east-2:        {CodeBucket: aws-well-architected-labs-ohio }
+       us-east-1:        {CodeBucket: aws-well-architected-labs-virginia }
+       us-west-1:        {CodeBucket: aws-well-architected-labs-california }
+       us-west-2:        {CodeBucket: aws-well-architected-labs-oregon }
+       ap-southeast-1:   {CodeBucket: aws-well-architected-labs-singapore }
+       eu-central-1:     {CodeBucket: aws-well-architected-labs-frankfurt }
+       eu-west-2:        {CodeBucket: aws-well-architected-labs-london }
+       eu-north-1:       {CodeBucket: aws-well-architected-labs-stockholm }
+       ap-southeast-2:   {CodeBucket: aws-well-architected-labs-ap-sydney }
+       ap-south-1:       {CodeBucket: aws-well-architected-labs-mumbai }
+       ap-northeast-3:   {CodeBucket: aws-well-architected-labs-osaka }
+       ap-northeast-2:   {CodeBucket: aws-well-architected-labs-seoul }
+       ap-northeast-1:   {CodeBucket: aws-well-architected-labs-tokyo }
+       ca-central-1:     {CodeBucket: aws-well-architected-labs-canada }
+       eu-west-3:        {CodeBucket: aws-well-architected-labs-paris }
+       sa-east-1:        {CodeBucket: aws-well-architected-labs-san-paulo }
+Resources:
+  CloudWatchTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: LambdaCloudWatchTrigger
+      Description: Lambda Data trigger
+      ScheduleExpression: "cron(0 8 1 * ? *)"  
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - Lambda
+            - Arn
+          Id: TriggerForJiraData
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+      Path: /
+      Policies:
+        - PolicyName: "LambdaTWGPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "trustedadvisor:Describe*"
+                  - "trustedadvisor:List*"
+                  - "trustedadvisor:GenerateReport"
+                  - "trustedadvisor:IncludeCheckItems"
+                  - "trustedadvisor:ExcludeCheckItems"
+                  - "trustedadvisor:RefreshCheck"                   
+                  - "support:DescribeTrustedAdvisorChecks"
+                  - "support:DescribeTrustedAdvisorCheckResult"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "cost-optimization-hub:ListEnrollmentStatuses"
+                  - "cost-optimization-hub:GetPreferences"
+                  - "cost-optimization-hub:GetRecommendation"
+                  - "cost-optimization-hub:ListRecommendations"
+                  - "cost-optimization-hub:ListRecommendationSummaries"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "ssm:Describe*"
+                  - "ssm:Get*"
+                  - "ssm:List*"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ParameterName}"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "Policy is used for collecting results for Trusted Advisor"          
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: jira_ticket_Lambda
+      Description: LambdaFunction of python3.10
+      Runtime: python3.11
+      Code:
+        ZipFile: |
+          from jira import JIRA
+          import boto3
+          from botocore.client import Config
+          from botocore.exceptions import ClientError
+          import logging
+          import json
+          import os
+
+          email = os.environ['EMAIL']
+          server = os.environ['SERVER']
+          project_name = os.environ['PROJECT_NAME']
+          account_id= boto3.client('sts').get_caller_identity().get('Account')
+
+          ignore_check_list = ['Amazon EC2 Reserved Instance Lease Expiration', 'Amazon EC2 Reserved Instance Optimization', 'Amazon ElastiCache Reserved Node Optimization', 'Amazon OpenSearch Service Reserved Instance Optimization', 'Amazon Redshift Reserved Node Optimization', 'Amazon Relational Database Service (RDS) Reserved Instance Optimization']
+
+          def lambda_handler(event, context):
+              read_ta(account_id)
+
+          def get_parameter_store(parameter_name):
+              client = boto3.client('ssm')
+              response = client.get_parameter(
+              Name=parameter_name,
+              WithDecryption=True)
+
+              API_TOKEN = response['Parameter']['Value']
+              return API_TOKEN
+
+          def jira_connection(api_token): 
+              # https://jira.readthedocs.io/api.html#jira.jirashell.handle_basic_auth
+              
+              jira_connection = JIRA(
+                  basic_auth=(email, api_token),
+                  server= server
+              )
+              return jira_connection
+
+          def list_jira_tickets(api_token, project_key): 
+              #https://www.geeksforgeeks.org/how-to-fetch-data-from-jira-in-python/
+              tickets = []
+              jiraOptions = {'server': server} 
+              jira = JIRA(options=jiraOptions, basic_auth=( 
+              email, api_token)) 
+              for singleIssue in jira.search_issues(jql_str=f'project = {project_name}'): 
+                  #print('{}:{}'.format(singleIssue.key, singleIssue.fields.summary)) 
+                  tickets.append(f"{singleIssue.fields.summary}")
+              return tickets
+
+
+
+          def jira_ticket(jira_connection, summary, description):
+              project_key = os.environ['PROJECT_KEY'] 
+              issue_dict = {
+                  'project': {'key': project_key},
+                  'summary': str(summary),
+                  'description': str(description),
+                  'issuetype': {'name': 'Task'}
+              } 
+
+              new_issue = jira_connection.create_issue(fields=issue_dict)
+              return new_issue
+
+          def read_ta(account_id):
+              parameter_name = os.environ['PARAMETER_NAME']
+              api_token = get_parameter_store(parameter_name)
+
+              connection = jira_connection(api_token)
+              project_key = os.environ['PROJECT_KEY'] 
+              tickets = list_jira_tickets(api_token, project_key)
+              
+              #Trusted Advisor Checks
+              support = boto3.client('support', 'us-east-1')
+              checks = support.describe_trusted_advisor_checks(language="en")["checks"] #https://boto3.amazonaws.com/v1/documentation/api/1.26.93/reference/services/support/client/describe_trusted_advisor_checks.html
+
+              for check in checks:
+                  if (check.get("category") != "cost_optimizing"): continue
+                  try:
+                      result = support.describe_trusted_advisor_check_result(checkId=check["id"], language="en")['result'] #https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/support/client/describe_trusted_advisor_check_result.html
+                      check_name = check["name"]
+                      if check_name not in ignore_check_list:
+                          for resource in result["flaggedResources"]:
+                              unique_id = f"ta-{check_name}-{resource['resourceId']}"
+                              print(unique_id)
+
+                              if unique_id in tickets: 
+                                  print(f"ticket for {unique_id} exist") 
+                                  exit
+                              else: 
+                                  ta_data = dict(zip(check['metadata'], resource['metadata']))
+                                  description = f'ta_check_name: {check_name} data:{ta_data} account_id: {account_id}'
+                                  ticket = jira_ticket(connection, unique_id, description )
+                                  print(f"{ticket}-{check_name}")
+                  except Exception as e:
+                      print(f'{type(e)}: {e}')
+
+              #Cost Optimization Hub Checks
+              coh_client = boto3.client('cost-optimization-hub', region_name='us-east-1')
+              response = coh_client.list_recommendations()
+
+              for item in response['items']:
+                  try:
+                      account_id = item['accountId']
+                      check_name = item['actionType']
+                      unique_id = f"coh-{check_name}-{item['resourceId']}"
+                      print(unique_id)
+                      if unique_id in tickets: 
+                          print(f"ticket for {unique_id} exist") 
+                          exit
+                      else: 
+                          description = f'coh_check_name: {check_name} data:{item} account_id: {account_id}'
+                          ticket = jira_ticket(connection, unique_id, description )
+                          print(f"{ticket}-{check_name}")
+                  except Exception as e:
+                      print(f'{type(e)}: {e}')
+
+
+      Handler: 'index.lambda_handler'
+      MemorySize: 2688
+      Timeout: 300
+      Role: 
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+      Environment:
+        Variables:
+          PARAMETER_NAME: !Ref ParameterName
+          SERVER: !Ref Server
+          EMAIL: !Ref Email
+          PROJECT_KEY: !Ref ProjectKey
+          PROJECT_NAME: !Ref ProjectName
+      Architectures:
+           - "arm64"
+      Layers:
+        - !Ref Layer
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Lambda}"
+      RetentionInDays: 14
+
+  EventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Lambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt CloudWatchTrigger.Arn
+  Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !FindInMap [RegionMap, !Ref "AWS::Region", CodeBucket]
+        S3Key: Cost/Blogs/layers/jira_layer.zip 
+      Description: jira layer
+      LayerName: jira-layer
