@@ -1,14 +1,12 @@
-## My Project
+## Turn Savings Recommendations into Jira Tickets
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+This blog will walk you through creating an AWS Lambda function to pull AWS Cost Optimization Hub and AWS Trusted Advisor Recommendations and create them as individual tickets in your chosen Jira board. This solution will review the recommendations and create a ticket for each one at the start of the month. 
 
 
 
+
+
+### Useful info
 
 
 *build code for jira
